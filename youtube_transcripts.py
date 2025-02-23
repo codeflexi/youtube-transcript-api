@@ -3,6 +3,7 @@ import time
 from typing import Any, Dict, List
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from youtube_transcript_api import (
     NoTranscriptFound,
     TooManyRequests,
@@ -15,6 +16,15 @@ app = FastAPI(
     title="YouTube Transcript API",
     description="An API to fetch transcripts from YouTube videos",
     version="1.0.0",
+)
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Cache to store recently fetched transcripts
@@ -70,6 +80,45 @@ def cache_transcript(video_id: str, language: str, transcript: List[Dict[str, An
     }
 
 
+def get_transcript_with_retry(
+    video_id: str, language: str = None, max_retries: int = 3
+):
+    """Get transcript with retry logic."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            if language:
+                return YouTubeTranscriptApi.get_transcript(
+                    video_id, languages=[language]
+                )
+            else:
+                return YouTubeTranscriptApi.get_transcript(video_id)
+        except TooManyRequests:
+            if attempt < max_retries - 1:
+                time.sleep(RETRY_DELAY * (attempt + 1))  # Exponential backoff
+                continue
+            last_error = "Too many requests. Please try again later."
+        except NoTranscriptFound:
+            last_error = (
+                f"No transcript found in language: {language if language else 'any'}"
+            )
+            break
+        except VideoUnavailable:
+            last_error = "Video is unavailable. It might be private or doesn't exist."
+            break
+        except TranscriptsDisabled:
+            last_error = "Transcripts are disabled for this video."
+            break
+        except Exception as e:
+            last_error = str(e)
+            if attempt < max_retries - 1:
+                time.sleep(RETRY_DELAY * (attempt + 1))
+                continue
+            break
+
+    raise Exception(last_error)
+
+
 @app.get("/transcript/", response_model=List[Dict[str, Any]])
 async def get_transcript(video_id: str, language: str = "th"):
     """
@@ -99,85 +148,35 @@ async def get_transcript(video_id: str, language: str = "th"):
         if cached_transcript:
             return cached_transcript
 
-        # Add delay to avoid rate limiting
-        time.sleep(RETRY_DELAY)
-
-        # Try to get all available transcripts
         try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(clean_video_id)
-        except VideoUnavailable:
-            raise HTTPException(
-                status_code=400,
-                detail="Video is unavailable. It might be private or doesn't exist.",
-            )
-        except TooManyRequests:
-            raise HTTPException(
-                status_code=429,
-                detail="YouTube is rate limiting requests. Please try again in a few minutes.",
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Could not access video transcripts: {str(e)}",
-            )
-
-        # Try to get the requested language directly
-        try:
-            transcript = transcript_list.find_transcript([language])
-            result = transcript.fetch()
-            cache_transcript(clean_video_id, language, result)
-            return result
-        except NoTranscriptFound:
-            # If requested language not found, try English and translate
+            # Try to get transcript with retries
+            transcript = get_transcript_with_retry(clean_video_id, language)
+            cache_transcript(clean_video_id, language, transcript)
+            return transcript
+        except Exception:
+            # If requested language fails, try English
             try:
-                # Try to get English transcript first
-                transcript = transcript_list.find_transcript(["en"])
-                translated = transcript.translate(language)
-                result = translated.fetch()
-                cache_transcript(clean_video_id, language, result)
-                return result
+                transcript = get_transcript_with_retry(clean_video_id, "en")
+                cache_transcript(clean_video_id, language, transcript)
+                return transcript
             except Exception:
-                # If English not available or translation fails, try any available transcript
+                # If English fails, try without language specification
                 try:
-                    # Get list of available transcripts
-                    available_transcripts = list(
-                        transcript_list._manually_created_transcripts.values()
-                    )
-                    if available_transcripts:
-                        # Get first available transcript
-                        available = available_transcripts[0]
-                        # Try to translate it
-                        translated = available.translate(language)
-                        result = translated.fetch()
-                        cache_transcript(clean_video_id, language, result)
-                        return result
-                    else:
-                        # List available languages for better error message
-                        available_langs = []
-                        for t in transcript_list._manually_created_transcripts.values():
-                            available_langs.append(f"{t.language_code} ({t.language})")
-                        for t in transcript_list._generated_transcripts.values():
-                            available_langs.append(f"{t.language_code} ({t.language})")
-
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"No transcripts available in {language}. Available languages: {', '.join(available_langs) if available_langs else 'none'}",
-                        )
-                except Exception as e:
+                    transcript = get_transcript_with_retry(clean_video_id)
+                    cache_transcript(clean_video_id, language, transcript)
+                    return transcript
+                except Exception as final_error:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Could not get or translate transcript: {str(e)}",
+                        detail=str(final_error),
                     )
 
-    except TranscriptsDisabled:
-        raise HTTPException(
-            status_code=400,
-            detail="Transcripts are disabled for this video. Please try a different video that has captions enabled.",
-        )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=400,
-            detail=f"Error processing request: {str(e)}",
+            detail=str(e),
         )
 
 
@@ -194,9 +193,6 @@ async def get_available_languages(video_id: str):
                 status_code=400,
                 detail="Invalid video ID format. Please provide a valid YouTube video ID (11 characters, alphanumeric with - and _)",
             )
-
-        # Add delay to avoid rate limiting
-        time.sleep(RETRY_DELAY)
 
         try:
             transcript_list = YouTubeTranscriptApi.list_transcripts(clean_video_id)
@@ -251,10 +247,12 @@ async def get_available_languages(video_id: str):
             pass
 
         return languages
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=400,
-            detail=f"Error fetching languages: {str(e)}",
+            detail=str(e),
         )
 
 
