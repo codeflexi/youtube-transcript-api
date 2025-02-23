@@ -2,7 +2,7 @@ import openai
 from youtube_transcript_api import YouTubeTranscriptApi
 
 # API Keys
-openai.api_key = "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"
+openai.api_key = "your-openai-api-key"
 VIDEO_ID = "zp0GqmvlwnQ"  # Replace with your desired video ID
 
 
